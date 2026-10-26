@@ -3,9 +3,10 @@
 The HTTP layer translates requests into calls to app.domain; the domain decides.
 See README.md for the four operations, their operationIds and their errors.
 """
-import itertools # For generating parcel IDs.
+import itertools  # For generating parcel IDs.
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -31,11 +32,41 @@ class EventBody(BaseModel):
     type: EventType
 
 
-def _problem(status: int, title: str, type_: str = "about:blank") -> JSONResponse:
+_PROBLEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string"},
+        "title": {"type": "string"},
+        "status": {"type": "integer"},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "loc": {"type": "array", "items": {"type": "string"}},
+                    "msg": {"type": "string"},
+                },
+                "required": ["loc", "msg"],
+            },
+        },
+    },
+    "required": ["type", "title", "status"],
+}
+
+
+def _problem(
+    status: int,
+    title: str,
+    type_: str = "about:blank",
+    errors: list[dict] | None = None,
+) -> JSONResponse:
+    content: dict = {"type": type_, "title": title, "status": status}
+    if errors is not None:
+        content["errors"] = errors
     return JSONResponse(
         status_code=status,
         media_type="application/problem+json",
-        content={"type": type_, "title": title, "status": status},
+        content=content,
     )
 
 
@@ -48,6 +79,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Tawseel Parcel API")
     parcels: dict[str, Parcel] = {}
     seq = itertools.count(1)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        errors = [{"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()]
+        return _problem(422, "Validation failed", errors=errors)
 
     def parcel_out(p: Parcel) -> dict:
         return {
@@ -67,7 +103,10 @@ def create_app() -> FastAPI:
         status_code=201,
         operation_id="createParcel",
         response_model=ParcelOut,
-        responses={409: {"description": "Duplicate merchant_ref"}},
+        responses={
+            409: {"description": "Duplicate merchant_ref", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+            422: {"description": "Invalid body", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+        },
     )
     def create_parcel(body: CreateBody) -> JSONResponse | dict:
         if duplicate_ref(body.merchant_ref):
@@ -89,7 +128,9 @@ def create_app() -> FastAPI:
         "/v1/parcels/{parcel_id}",
         operation_id="getParcel",
         response_model=ParcelOut,
-        responses={404: {"description": "Parcel not found"}},
+        responses={
+            404: {"description": "Parcel not found", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+        },
     )
     def get_parcel(parcel_id: str) -> JSONResponse | dict:
         p = parcels.get(parcel_id)
@@ -102,20 +143,34 @@ def create_app() -> FastAPI:
         operation_id="recordParcelEvent",
         response_model=ParcelOut,
         responses={
-            404: {"description": "Not found"},
-            409: {"description": "Invalid transition"},
+            404: {"description": "Parcel not found", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+            409: {"description": "Invalid transition", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+            422: {"description": "Unknown or missing event type", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
         },
     )
     def record_parcel_event(parcel_id: str, body: EventBody) -> JSONResponse | dict:
         p = parcels.get(parcel_id)
         if p is None:
-            return _problem(404, "Not found")
+            return _problem(404, "Parcel not found")
         try:
             updated = apply_event(p, body.type)
         except InvalidTransition:
             return _problem(409, "Invalid transition", "invalid-transition")
         parcels[parcel_id] = updated
         return parcel_out(updated)
+
+    # FastAPI auto-declares a 422 for every operation with a path parameter,
+    # but getParcel has no 422 in the contract; drop it from the schema.
+    orig_openapi = app.openapi
+
+    def custom_openapi() -> dict:
+        if not app.openapi_schema:
+            schema = orig_openapi()
+            schema["paths"]["/v1/parcels/{parcel_id}"]["get"]["responses"].pop("422", None)
+            app.openapi_schema = schema
+        return app.openapi_schema
+
+    app.openapi = custom_openapi
 
     return app
 
