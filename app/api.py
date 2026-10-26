@@ -5,7 +5,7 @@ See README.md for the four operations, their operationIds and their errors.
 """
 import itertools  # For generating parcel IDs.
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -30,6 +30,11 @@ class ParcelOut(BaseModel):
 
 class EventBody(BaseModel):
     type: EventType
+
+
+class PageOut(BaseModel):
+    items: list[ParcelOut]
+    next_cursor: str | None
 
 
 _PROBLEM_SCHEMA = {
@@ -79,6 +84,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Tawseel Parcel API")
     parcels: dict[str, Parcel] = {}
     seq = itertools.count(1)
+    seqs: dict[str, int] = {}   # parcel_id -> creation seq; the cursor's numbers
+    issued: set[str] = set()    # cursors this app actually handed out
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -112,12 +119,13 @@ def create_app() -> FastAPI:
         if duplicate_ref(body.merchant_ref):
             return _problem(409, "Duplicate merchant_ref", "duplicate-merchant-ref")
         p = Parcel(
-            id=f"pcl_{next(seq)}",
+            id=f"pcl_{(s := next(seq))}",
             merchant_ref=body.merchant_ref,
             cod_amount_piastres=body.cod_amount_piastres,
             address_text=body.address_text,
         )
         parcels[p.id] = p
+        seqs[p.id] = s
         return JSONResponse(
             status_code=201,
             content=parcel_out(p),
@@ -137,6 +145,39 @@ def create_app() -> FastAPI:
         if p is None:
             return _problem(404, "Parcel not found")
         return parcel_out(p)
+
+    @app.get(
+        "/v1/parcels",
+        operation_id="listParcels",
+        response_model=PageOut,
+        responses={
+            400: {"description": "Invalid cursor", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+            422: {"description": "Invalid query parameters", "content": {"application/problem+json": {"schema": _PROBLEM_SCHEMA}}},
+        },
+    )
+    def list_parcels(
+        state: ParcelState | None = Query(default=None),
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None),
+    ) -> dict:
+        after = 0
+        if cursor is not None:
+            if cursor not in issued:
+                return _problem(400, "Invalid cursor", "invalid-cursor")
+            after = int(cursor)
+        matches = sorted(
+            (
+                (seqs[p.id], p)
+                for p in parcels.values()
+                if seqs[p.id] > after and (state is None or p.state == state)
+            ),
+            key=lambda t: t[0],
+        )
+        page = matches[:limit]
+        next_cursor = str(page[-1][0]) if len(matches) > limit else None
+        if next_cursor is not None:
+            issued.add(next_cursor)
+        return {"items": [parcel_out(p) for _, p in page], "next_cursor": next_cursor}
 
     @app.post(
         "/v1/parcels/{parcel_id}/events",
