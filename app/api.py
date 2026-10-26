@@ -27,6 +27,10 @@ class ParcelOut(BaseModel):
     attempts: int
 
 
+class EventBody(BaseModel):
+    type: EventType
+
+
 def _problem(status: int, title: str, type_: str = "about:blank") -> JSONResponse:
     return JSONResponse(
         status_code=status,
@@ -92,6 +96,26 @@ def create_app() -> FastAPI:
         if p is None:
             return _problem(404, "Parcel not found")
         return parcel_out(p)
+
+    @app.post(
+        "/v1/parcels/{parcel_id}/events",
+        operation_id="recordParcelEvent",
+        response_model=ParcelOut,
+        responses={
+            404: {"description": "Not found"},
+            409: {"description": "Invalid transition"},
+        },
+    )
+    def record_parcel_event(parcel_id: str, body: EventBody) -> JSONResponse | dict:
+        p = parcels.get(parcel_id)
+        if p is None:
+            return _problem(404, "Not found")
+        try:
+            updated = apply_event(p, body.type)
+        except InvalidTransition:
+            return _problem(409, "Invalid transition", "invalid-transition")
+        parcels[parcel_id] = updated
+        return parcel_out(updated)
 
     return app
 
